@@ -1,3 +1,5 @@
+import { analyzeConflicts, coveredSlots, isActive, LANE_CAPACITY, recordRelease } from './gateCore.js';
+
 export type ContainerStatus = 'in-transit' | 'at-gate' | 'in-yard' | 'on-quay' | 'released' | 'hold';
 export type EquipmentKind = 'quay-crane' | 'yard-crane' | 'terminal-truck' | 'reach-stacker';
 export type TaskStatus = 'queued' | 'assigned' | 'executing' | 'blocked' | 'done';
@@ -6,12 +8,15 @@ export type AppointmentStatus = 'booked' | 'checked-in' | 'completed' | 'cancell
 export interface Voyage { id: string; vessel: string; imo: string; service: string; eta: string; etd: string; status: 'approaching' | 'berthed' | 'loading' | 'departed'; berth: string; movesPlanned: number; movesDone: number; lateRisk: 'low' | 'medium' | 'high'; }
 export interface Container { id: string; voyageId: string; size: '20' | '40' | '45'; isoType: string; direction: 'import' | 'export' | 'transshipment'; status: ContainerStatus; weightT: number; reefer: boolean; temperature?: number; hazmatClass?: string; customs: 'released' | 'inspection' | 'hold'; priority: 'normal' | 'hot' | 'reefer' | 'hazmat'; yardSlot: string; appointmentId?: string; lastEvent: string; }
 export interface YardBlock { id: string; zone: string; rows: number; tiers: number; capacity: number; occupied: number; reeferPlugs: number; usedPlugs: number; hazmatAllowed: boolean; equipment: EquipmentKind[]; heat: number; }
-export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; }
+export interface GateAppointment { id: string; containerId: string; truckNo: string; driver: string; type: 'pickup' | 'dropoff'; windowStart: string; windowEnd: string; lane: 'north' | 'south' | 'rail'; status: AppointmentStatus; sealVerified: boolean; weightVerified: boolean; exception?: string; version: number; }
 export interface Equipment { id: string; name: string; kind: EquipmentKind; status: 'available' | 'working' | 'maintenance' | 'offline'; location: string; battery: number; queue: number; movesPerHour: number; }
 export interface YardTask { id: string; kind: 'receive' | 'deliver' | 'rehandle' | 'load' | 'discharge' | 'inspect'; containerId: string; from: string; to: string; equipmentId?: string; priority: number; status: TaskStatus; scheduledAt: string; blockingReasons: string[]; estimatedMinutes: number; }
 export interface AuditEvent { id: string; actor: string; action: string; entity: string; entityId: string; at: string; details: string; }
 
 const start = Date.now(); const iso = (minutes: number) => new Date(start + minutes * 60000).toISOString();
+const _today = new Date(); const nextMidnightUtc = Date.UTC(_today.getUTCFullYear(), _today.getUTCMonth(), _today.getUTCDate() + 1);
+const beforeMidnight = (minutes: number) => new Date(nextMidnightUtc - minutes * 60000).toISOString();
+const afterMidnight = (minutes: number) => new Date(nextMidnightUtc + minutes * 60000).toISOString();
 export const voyages: Voyage[] = [
   { id: 'VOY-AX7', vessel: 'MSC Aurora', imo: 'IMO9382014', service: 'AE-3', eta: iso(-90), etd: iso(350), status: 'berthed', berth: 'B07', movesPlanned: 1240, movesDone: 886, lateRisk: 'medium' },
   { id: 'VOY-QF2', vessel: 'Ever Quartz', imo: 'IMO9721103', service: 'TP9', eta: iso(190), etd: iso(890), status: 'approaching', berth: 'B04', movesPlanned: 760, movesDone: 0, lateRisk: 'high' },
@@ -33,10 +38,13 @@ export const containers: Container[] = [
   { id: 'TEMU-1774029', voyageId: 'VOY-AX7', size: '40', isoType: '45R1', direction: 'import', status: 'in-yard', weightT: 26.3, reefer: true, temperature: 4, customs: 'inspection', priority: 'reefer', yardSlot: 'D05-R05-T1', lastEvent: '待海关查验' }
 ];
 export const appointments: GateAppointment[] = [
-  { id: 'APT-9001', containerId: 'OOLU-7734201', truckNo: '沪A·7K229', driver: '陈海', type: 'dropoff', windowStart: iso(-14), windowEnd: iso(16), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true },
-  { id: 'APT-9002', containerId: 'MSCU-4829017', truckNo: '苏E·66218', driver: '王建国', type: 'pickup', windowStart: iso(34), windowEnd: iso(64), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
-  { id: 'APT-9003', containerId: 'EISU-1288420', truckNo: '沪B·02891', driver: '赵晨', type: 'pickup', windowStart: iso(38), windowEnd: iso(68), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false },
-  { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短' }
+  { id: 'APT-9001', containerId: 'OOLU-7734201', truckNo: '沪A·7K229', driver: '陈海', type: 'dropoff', windowStart: iso(-14), windowEnd: iso(16), lane: 'south', status: 'checked-in', sealVerified: true, weightVerified: true, version: 1 },
+  { id: 'APT-9002', containerId: 'MSCU-4829017', truckNo: '苏E·66218', driver: '王建国', type: 'pickup', windowStart: iso(34), windowEnd: iso(64), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false, version: 1 },
+  { id: 'APT-9003', containerId: 'EISU-1288420', truckNo: '沪B·02891', driver: '赵晨', type: 'pickup', windowStart: iso(38), windowEnd: iso(68), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false, version: 1 },
+  { id: 'APT-9004', containerId: 'FCIU-9920310', truckNo: '沪A·7K229', driver: '陈海', type: 'pickup', windowStart: iso(4), windowEnd: iso(22), lane: 'south', status: 'booked', sealVerified: false, weightVerified: false, exception: '同一车辆相邻窗口过短', version: 1 },
+  { id: 'APT-9005', containerId: 'TEMU-1774029', truckNo: '浙B·30916', driver: '刘伟', type: 'pickup', windowStart: iso(46), windowEnd: iso(76), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false, exception: '海关查验中，等待放行回执', version: 1 },
+  { id: 'APT-9006', containerId: 'CMAU-6001722', truckNo: '苏E·57102', driver: '孙强', type: 'dropoff', windowStart: iso(42), windowEnd: iso(70), lane: 'north', status: 'booked', sealVerified: false, weightVerified: false, version: 1 },
+  { id: 'APT-9007', containerId: 'FCIU-9920310', truckNo: '皖J·88420', driver: '周敏', type: 'dropoff', windowStart: beforeMidnight(40), windowEnd: afterMidnight(20), lane: 'rail', status: 'booked', sealVerified: false, weightVerified: false, version: 1 }
 ];
 export const equipment: Equipment[] = [
   { id: 'QC-07', name: '岸桥 QC-07', kind: 'quay-crane', status: 'working', location: 'B07 / MSC Aurora', battery: 96, queue: 4, movesPerHour: 31 },
@@ -54,18 +62,38 @@ export const tasks: YardTask[] = [
 export const auditEvents: AuditEvent[] = [{ id: 'AUD-500', actor: '中控调度员', action: 'REPLAN', entity: 'voyage', entityId: 'VOY-AX7', at: new Date(start - 20 * 60000).toISOString(), details: '因 QC-07 瞬时降速，重新计算 14 个高优先级作业' }];
 
 function parseSlot(slot: string) { const match = slot.match(/^([A-Z]\d\d)-/); return match?.[1]; }
+
+/** 预约离开活动队列（取消/删除/完成）时，原占用的 30 分钟时隙立即归还台账，可被新预约再次占用 */
+function releaseGateSlots(item: GateAppointment, previousStatus: AppointmentStatus, reason: 'cancelled' | 'deleted' | 'replan') {
+  const leaving = isActive({ ...item, status: previousStatus }) && !isActive(item);
+  if (!leaving) return;
+  recordRelease({
+    appointmentId: item.id, truckNo: item.truckNo, lane: item.lane,
+    slotStarts: coveredSlots(item.windowStart, item.windowEnd).map(t => new Date(t).toISOString()),
+    reason,
+  });
+}
+
+/** 车道时隙容量校验：新窗口覆盖的每个 30 分钟时隙都不能超过车道容量（排除自身与已取消/完成的预约） */
+export function checkLaneCapacity(input: { windowStart: string; windowEnd: string; lane: GateAppointment['lane']; selfId?: string }) {
+  const overloaded = coveredSlots(input.windowStart, input.windowEnd)
+    .map(slot => ({ slot, load: appointments.filter(a => a.id !== input.selfId && isActive(a) && a.lane === input.lane && coveredSlots(a.windowStart, a.windowEnd).includes(slot)).length }))
+    .find(entry => entry.load >= LANE_CAPACITY[input.lane]);
+  if (overloaded) throw new Error(`该窗口在 ${new Date(new Date(overloaded.slot).getTime() - new Date().getTimezoneOffset() * 60000).toLocaleString([], { hour: '2-digit', minute: '2-digit' })} 时段，车道容量 ${LANE_CAPACITY[input.lane]} 车已满，请改用时隙编排建议`);
+}
 export function dashboard() {
   const activeVoyages = voyages.filter(v => v.status !== 'departed');
   const yardCapacity = blocks.reduce((sum, block) => sum + block.capacity, 0); const yardOccupied = blocks.reduce((sum, block) => sum + block.occupied, 0);
   return { activeVoyages: activeVoyages.length, berthMoves: activeVoyages.reduce((sum, v) => sum + v.movesPlanned - v.movesDone, 0), yardUtilization: yardOccupied / yardCapacity, gateQueue: appointments.filter(a => a.status === 'checked-in').length + 7, pendingTasks: tasks.filter(t => t.status !== 'done').length, blockedTasks: tasks.filter(t => t.status === 'blocked').length, reeferAlerts: containers.filter(c => c.reefer && (c.customs === 'inspection' || (c.temperature ?? 0) > 5)).length, hazmatHolds: containers.filter(c => c.hazmatClass && c.customs !== 'released').length, lateVessels: activeVoyages.filter(v => v.lateRisk === 'high').length };
 }
 export function gateConflicts() {
-  const result: { severity: 'critical' | 'warning'; appointmentId: string; reason: string }[] = [];
-  appointments.forEach((a, index) => appointments.slice(index + 1).forEach(b => {
-    const overlap = a.truckNo === b.truckNo && new Date(a.windowStart).getTime() < new Date(b.windowEnd).getTime() && new Date(b.windowStart).getTime() < new Date(a.windowEnd).getTime();
-    if (overlap) result.push({ severity: 'critical', appointmentId: a.id, reason: `车辆 ${a.truckNo} 与 ${b.id} 时间窗口重叠，需重新分配闸口时隙` });
-  }));
-  appointments.filter(a => a.status === 'booked').forEach(a => { const container = containers.find(c => c.id === a.containerId); if (container?.customs !== 'released') result.push({ severity: 'warning', appointmentId: a.id, reason: `箱 ${a.containerId} 海关状态为 ${container?.customs}，无法无条件放行` }); });
+  // 复用时隙编排引擎（同车重叠 / 车道超容 / 海关未放行 / 跨日），按预约展开，保证冲突列表与编排建议始终一致
+  const result: { severity: 'critical' | 'warning'; appointmentId: string; reason: string; kind?: string; conflictId?: string }[] = [];
+  analyzeConflicts(appointments, containers).forEach(conflict => {
+    conflict.appointmentIds.forEach(appointmentId => {
+      result.push({ severity: conflict.severity, appointmentId, reason: conflict.reason, kind: conflict.kind, conflictId: conflict.id });
+    });
+  });
   return result;
 }
 export function yardHeatmap() { return blocks.map(block => ({ ...block, utilization: block.occupied / block.capacity, freeSlots: block.capacity - block.occupied, pressure: block.heat > 85 ? 'critical' : block.heat > 65 ? 'warning' : 'normal' })); }
@@ -80,12 +108,12 @@ export function containerPlan(containerId: string) {
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
 export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
-export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
+export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified' | 'version'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
-  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false }; appointments.unshift(item); container.appointmentId = item.id; return item;
+  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false, version: 1 }; appointments.unshift(item); container.appointmentId = item.id; return item;
 }
-export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; Object.assign(item, patch); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
+export function updateAppointment(id: string, patch: Partial<Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) { const item = appointments.find(a => a.id === id); if (!item) return undefined; const prevStatus = item.status; Object.assign(item, patch); item.version += 1; releaseGateSlots(item, prevStatus, 'cancelled'); const container = containers.find(c => c.id === item.containerId); if (item.status === 'checked-in' && container) container.status = 'at-gate'; if (item.status === 'completed' && container) container.status = item.type === 'pickup' ? 'released' : 'in-yard'; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '闸口值班员', action: 'GATE_UPDATE', entity: 'appointment', entityId: id, at: new Date().toISOString(), details: JSON.stringify(patch) }); return item; }
 export function assignTask(id: string, equipmentId: string) { const task = tasks.find(item => item.id === id); const machine = equipment.find(item => item.id === equipmentId); if (!task || !machine) return undefined; const blockingReasons = [...task.blockingReasons]; if (machine.status === 'maintenance' || machine.status === 'offline') blockingReasons.push(`${machine.name} 当前不可用`); if (task.kind === 'inspect' && machine.kind !== 'reach-stacker') blockingReasons.push('查验作业需要正面吊或专用设备'); task.equipmentId = equipmentId; task.status = blockingReasons.length ? 'blocked' : 'assigned'; task.blockingReasons = blockingReasons; auditEvents.unshift({ id: `AUD-${Date.now()}`, actor: '中控调度员', action: 'ASSIGN_TASK', entity: 'yard-task', entityId: id, at: new Date().toISOString(), details: `${equipmentId} -> ${task.containerId}` }); return task; }
 export function containerDetail(id: string) { const container = containers.find(item => item.id === id); if (!container) return undefined; return { container, voyage: voyages.find(v => v.id === container.voyageId), appointment: appointments.find(a => a.id === container.appointmentId), plan: containerPlan(id), tasks: tasks.filter(t => t.containerId === id) }; }
 
@@ -133,7 +161,10 @@ export function deleteContainer(id: string) {
   if (index < 0) return undefined;
   const [item] = containers.splice(index, 1);
   const removedAppointments = appointments.filter(appointment => appointment.containerId === id);
-  for (const appointment of removedAppointments) appointments.splice(appointments.indexOf(appointment), 1);
+  for (const appointment of removedAppointments) {
+    appointments.splice(appointments.indexOf(appointment), 1);
+    if (isActive(appointment)) recordRelease({ appointmentId: appointment.id, truckNo: appointment.truckNo, lane: appointment.lane, slotStarts: coveredSlots(appointment.windowStart, appointment.windowEnd).map(t => new Date(t).toISOString()), reason: 'deleted' });
+  }
   const removedTasks = tasks.filter(task => task.containerId === id);
   for (const task of removedTasks) tasks.splice(tasks.indexOf(task), 1);
   recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条未完成任务`);
@@ -145,26 +176,38 @@ export function createGateAppointment(input: AppointmentInput) {
   if (!container) throw new Error('箱号不存在');
   if (input.type === 'pickup' && container.customs !== 'released') throw new Error('海关未放行，不能预约提箱');
   if (new Date(input.windowEnd) <= new Date(input.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
-  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false };
+  checkLaneCapacity(input);
+  const item: GateAppointment = { ...input, id: `APT-${Date.now()}`, status: 'booked', sealVerified: false, weightVerified: false, version: 1 };
   appointments.unshift(item);
   container.appointmentId = item.id;
   recordAudit('CREATE', 'appointment', item.id, `为 ${item.containerId} 创建闸口预约`);
   return item;
 }
 
+const STRUCTURAL_KEYS = ['windowStart', 'windowEnd', 'lane'] as const;
+
 export function editGateAppointment(id: string, patch: Partial<AppointmentInput & Pick<GateAppointment, 'status' | 'sealVerified' | 'weightVerified' | 'exception'>>) {
   const item = appointments.find(appointment => appointment.id === id);
   if (!item) return undefined;
   if (patch.containerId && !containers.some(container => container.id === patch.containerId)) throw new Error('箱号不存在');
-  if (patch.windowStart && patch.windowEnd && new Date(patch.windowEnd) <= new Date(patch.windowStart)) throw new Error('预约结束时间必须晚于开始时间');
+  const structuralChanged = STRUCTURAL_KEYS.some(key => patch[key] !== undefined && patch[key] !== item[key]);
+  // 已签到 / 已完成的车辆已在场，窗口与车道锁定，只有取消、异常登记等状态字段可更新
+  if (structuralChanged && item.status !== 'booked') throw new Error(`预约已 ${item.status === 'checked-in' ? '签到' : '完成'}，车辆已在场，窗口与车道锁定；如需调整请转人工异常处理`);
+  const nextStart = patch.windowStart ?? item.windowStart;
+  const nextEnd = patch.windowEnd ?? item.windowEnd;
+  if (new Date(nextEnd) <= new Date(nextStart)) throw new Error('预约结束时间必须晚于开始时间');
+  const previousStatus = item.status;
   const previousContainer = containers.find(container => container.id === item.containerId);
   Object.assign(item, patch);
+  if (structuralChanged) checkLaneCapacity({ windowStart: item.windowStart, windowEnd: item.windowEnd, lane: item.lane, selfId: item.id });
+  item.version += 1;
+  releaseGateSlots(item, previousStatus, 'cancelled');
   const nextContainer = containers.find(container => container.id === item.containerId);
   if (previousContainer && previousContainer.id !== nextContainer?.id && previousContainer.appointmentId === id) previousContainer.appointmentId = undefined;
   if (nextContainer) nextContainer.appointmentId = id;
   if (item.status === 'checked-in' && nextContainer) nextContainer.status = 'at-gate';
   if (item.status === 'completed' && nextContainer) nextContainer.status = item.type === 'pickup' ? 'released' : 'in-yard';
-  recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙：${JSON.stringify(patch)}`);
+  recordAudit('UPDATE', 'appointment', id, `更新预约状态/时隙（版本 ${item.version}）：${JSON.stringify(patch)}`);
   return item;
 }
 
@@ -172,9 +215,17 @@ export function deleteGateAppointment(id: string) {
   const index = appointments.findIndex(item => item.id === id);
   if (index < 0) return undefined;
   const [item] = appointments.splice(index, 1);
+  const wasActive = isActive(item);
+  if (wasActive) {
+    recordRelease({
+      appointmentId: item.id, truckNo: item.truckNo, lane: item.lane,
+      slotStarts: coveredSlots(item.windowStart, item.windowEnd).map(t => new Date(t).toISOString()),
+      reason: 'deleted',
+    });
+  }
   const container = containers.find(entry => entry.id === item.containerId);
   if (container?.appointmentId === id) container.appointmentId = undefined;
-  recordAudit('DELETE', 'appointment', id, `取消并删除 ${item.containerId} 的闸口预约`);
+  recordAudit('DELETE', 'appointment', id, `取消并删除 ${item.containerId} 的闸口预约，释放 ${wasActive ? coveredSlots(item.windowStart, item.windowEnd).length : 0} 个车道时隙`);
   return item;
 }
 
